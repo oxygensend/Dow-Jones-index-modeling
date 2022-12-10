@@ -1,0 +1,382 @@
+---
+title: "projekt_zaliczeniowy"
+output:
+  html_document:
+    df_print: paged
+date: "2022-11-27"
+---
+
+
+Wczytanie danych z pliku. W danych zawarty jest opis, dlatego pierwsze 15 wierszy zostało pominiete.
+```{r}
+library(readxl)
+library(ggplot2)
+library(dplyr)
+library(forecast)
+library(zoo)
+df = read_excel('Dow_Jones.xlsx', skip=15, col_names = c("month", "index_value"))
+df
+```
+Podstawowe statystyki:
+```{r}
+summary(df)
+str(df)
+nrow(df)
+```
+Po przeglądnieciu statysyk można zauważyc, że mamy tutaj do czynienia z szeregiem czasowym określającym wartość indeksu Dow-Jones na koniec każdego miesiąca. W data framie występują dwie wartości brakujące.
+Zobaczmy jak wygląda przebieg tego szeregu.
+```{r}
+ggplot(data=df, aes(x=month, y=index_value)) + geom_line()
+```
+
+
+```{r}
+ggplot(data=df,aes(y=index_value)) + geom_boxplot()
+```
+
+```{r}
+ggplot(data=df, aes(x=index_value)) + geom_histogram()
+```
+Na każdym z trzech powyżej przedstawionych wykresów można zauważyć, występujące wartości odstające w pobliżu 120000 oraz 0, które zabużają wartość indeksu. Wartości te są abstrakcyjne, ponieważ w historii indeks nigdy nie osiągnął 0 ani 120000. W następnych krokach szereg zostanie oczyszczony z wartości odstających metodą wskaźnika IQR
+
+```{r}
+Q1 = quantile(df$index_value, .25, na.rm=TRUE)
+Q3 = quantile(df$index_value, .75, na.rm=TRUE)
+IQR = IQR(df$index_value, na.rm=TRUE)
+
+df = df %>%
+  mutate(index_value = ifelse(df$index_value > (Q1 - 1.5*IQR) &
+                              df$index_value < (Q3 + 1.5*IQR), index_value, NA) 
+         )
+
+```
+
+```{r}
+sum(is.na(df$index_value))
+```
+Rozkład indeksu nie należy do rozkładu normalnego
+```{r}
+ggplot(data=df, aes(x=index_value)) + geom_histogram()
+```
+
+```{r}
+ggplot(data=df,aes(y=index_value)) + geom_boxplot()
+```
+Wartości odstające zostały usunięte, aczkolwiek w zbiorze nadal występują braki danych co widać też na wykresie poniżej.
+```{r}
+ggplot(data=df, aes(x=month, y=index_value)) + geom_line()
+```
+Ponieważ jest to szereg czasowy i są to dane historyczny pozbycie sie 5 miesięcy ze zbioru może wiąząć się z niepoprawnymi wynikami w predykcji, tego nie chcemy, dlatego wartości odstające zostaną usunięte.Do zastąpienie brakujących wartości uzyjemy funkcji aproksymacyjnej z pakietu zoo.
+
+```{r}
+i_ts = ts(df$index_value,start=c(1968,8),end=c(1992,10),frequency=12)
+i_ts =  na.approx(i_ts);
+sum(is.na(i_ts))
+
+```
+
+```{r}
+autoplot(i_ts)
+```
+Z wykresu liniowego możemy wysunąć stwierdzenie, że występuje trend rosnący z pewną powtażającą się sezonowością addytywną. Zobaczmy wykresy ACF oraz PACF potwierdzenia hipotezy.
+
+```{r}
+acf(df$index_value, na.action = na.pass)
+```
+Na wykresie ACF można zauwazyć powolny spadek wraz ze wzortem lagów, oznacza to że zbiór posiada trend. Co do sezonowatosci ciezko tutaj stwierdzić, ponieważ brak jest  lagów ktore odbiegały by rozmiarem od innych, aczkolwiek można zauważyc, że peaki tworzą "delikatne fale"
+```{r}
+pacf(df$index_value, na.action = na.pass)
+```
+Na wykrecie PACF mozemy zauwzyc znaczaca korelacje na 1 lagu, która znacząco spadana na juz na drugi logu.
+
+Dokonajmy dekompozycji szeregu
+```{r}
+decomposed =  decompose(i_ts)
+
+plot(decomposed)
+```
+
+Usunmy trend oraz sezonowość, zeby zobrazować sobie jak te dwie cechy wplywaja na nasz szereg. Mozna zauwzyc, ze po odjeciu sezonowatosci od szeregu szereg się nie zmienil, może to oznaczyc jego brak wystepowania.
+```{r}
+tsWithoutTrend = i_ts/decomposed$trend
+plot(i_ts-decomposed$trend)
+plot(i_ts-decomposed$seasonal)
+```
+
+Sprawdzmy jak wygladaja dane na danych intervałach 1,2,5,10 lat, w celu potwierdzenia braku sezonowatosci
+```{R}
+startYear = 1968
+
+while (startYear < 1992) {
+  plot(window(i_ts, start=c(startYear,1), end=c(startYear+1,1)))
+  startYear =startYear+1
+}
+```
+```{R}
+startYear = 1968
+
+while (startYear < 1992) {
+  plot(window(i_ts, start=c(startYear,1), end=c(startYear+2,1)))
+  startYear =startYear+2
+}
+```
+```{r}
+startYear = 1968
+
+while (startYear < 1992) {
+  plot(window(i_ts, start=c(startYear,1), end=c(startYear+5,1)))
+  startYear =startYear+5
+}
+```
+```{r}
+startYear = 1968
+
+while (startYear < 1998) {
+  plot(window(i_ts, start=c(startYear,1), end=c(startYear+10,1)))
+  startYear =startYear+10
+}
+```
+W zadnym okresie nie wystepuje podobienstwo pomiedzy wykresami, zatem definitywnie utwierdzam się w przekonaniu, że w szeregu nie wystepuje sezonowość. Wiec szereg ma trend rosnacy bez sezonowosci.
+
+
+Przejdzmy do modelowania szeregu
+
+Podział danych na testowe i treningowe z założeniem 4 elementowego zbioru testowego
+```{r}
+train = head(i_ts,length(i_ts)-4)
+test = tail(i_ts, 4)
+
+is_no_trend = diff(i_ts)
+train_no_trend = head(is_no_trend,length(is_no_trend)-4)
+test_no_trend = tail(is_no_trend, 4)
+```
+
+
+Model nr 1. Modelowanie szeregu za pomoca metody Simple Exponential Smoothing.
+Metoda SES wykorzystywana jest do szeregow nie wykazujących trendu oraz sezonowosci. W przypadku naszych danych trend jest widoczny, dlatego musimy się go pozbyć
+```{r}
+autoplot(train_no_trend)
+```
+Jako pierwszy model wykonajamy sobie model z podstawowymi parametrami(pozwalamy modelowi wyestymowac najlepszy za nas) w oknie o wielkosci 4 
+```{r}
+basic_model_ses = ses(train_no_trend,  h=4)
+basic_model_ses$model
+```
+```{r}
+autoplot(basic_model_ses)
+```
+```{r}
+autoplot(train_no_trend) +
+  autolayer(basic_model_ses$mean,
+            color = "red") 
+```
+
+```{r}
+ autoplot(test_no_trend) +
+  autolayer(basic_model_ses, alpha=0.5) +
+  ggtitle("Predicted vs actuals")
+```
+Rozkład residuów modelu sprowadza się do rozkładu normalnego
+```{R}
+hist(basic_model_ses$residuals)
+```
+
+```{r}
+plot(basic_model_ses$fitted, basic_model_ses$residuals)
+title("fitted vs residuals")
+```
+
+Zoptymalizujemy parametr alpha w modelu metodą minimalizacji wskaznika RMSE w celu uzuskania lepszego przedziału rozwiązań
+```{r}
+# comparing our model
+alpha = seq(.01, .99, by = .01)
+RMSE = c()
+for(i in seq_along(alpha)) {
+  fit = ses(train_no_trend, alpha = alpha[i],
+             h = 4)
+  RMSE[i] = accuracy(fit,
+                      test_no_trend)[2,2]
+}
+alpha_fit = data_frame(alpha, RMSE)
+alpha_min = filter(alpha_fit,
+                    RMSE == min(RMSE))
+ 
+alpha_min
+```
+
+Najniższe RMSE, które i tak jest relatywnie duże zostało uzyskane zostało za pomocą alpha = 0.99
+```{r}
+
+ggplot(alpha_fit, aes(alpha, RMSE)) +
+  geom_line() +
+  geom_point(data = alpha_min,
+             aes(alpha, RMSE),
+             size = 2, color = "red")
+```
+
+Model z parametrem alpha = 0.99
+```{r}
+final_model_ses = ses(train_no_trend, alpha=.99, h=4)
+autoplot(final_model_ses)
+
+```
+```{r}
+final_model_ses$model
+```
+
+Porównanie modeli
+
+Przedstawienie sredniej modelu na wykresie szeregu
+```{r}
+autoplot(train_no_trend) +
+  autolayer(final_model_ses$mean,
+            color = "red") 
+```
+
+```{r}
+ autoplot(test_no_trend) +
+  autolayer(final_model_ses, alpha=0.5) +
+  ggtitle("Predicted vs actuals")
+```
+Rozkład residuów modelu sprowadza się do rozkładu normalnego
+```{R}
+hist(final_model_ses$residuals)
+```
+
+```{r}
+plot(final_model_ses$fitted, final_model_ses$residuals)
+title("fitted vs residuals")
+```
+```{r}
+accuracy(basic_model_ses, test_no_trend)
+```
+```{r}
+accuracy(final_model_ses, test_no_trend)
+```
+Porównianie otrzymanych modeli na wykresie 
+```{r}
+
+p1 <- autoplot(basic_model_ses) +
+  coord_cartesian(ylim = c(-120, 120)) +
+  ggtitle("Original SES Model") 
+p2 <- autoplot(final_model_ses) +
+  coord_cartesian(ylim = c(-120, 120)) +
+  ggtitle("Optimal SES Model") 
+
+
+gridExtra::grid.arrange(p1, p2, nrow = 1)
+```
+Dzięki optymalizacji udało się zopytamalizować RMSE z 25 do 22 oraz wskaznik predykcji mape ze 100 do 90, co nadal nie jest zbyt zadawalącym wynikiem. W Obu przypadkach resiuda sprowadzaja sie do rozkladu normalnego, natomiast wariancja w modelu numer 1 jest blizsza 0 ze wzledu na mniejszy przedział ufności możliwych wyników. Ze wzgledu na to, że dany model oparty jest o szereg z usunietym trendem, wybrał bym model numer 2, przede wszystkim ze wzgledu na lepszy MAPE oraz RMSE, ale i wiekszy przedzial ufnosci, na wykresie można zuważyć można wiele odchylen, przez co moim zdaniem taki scenariusz jest bardziej pradopodobny.
+
+
+Model nr 2. Model Holta.
+
+Drugi model wykonany z zastosowaniem metody Holta. Wybór padł na tą metodę ze względu na występowanie trendu w szeregu, przez co idealnie pasuję do przedstawonych danych.
+Tak samo jak w przypadku pierwszym wykonajmy podstawowy model w oknie 4 elementowym w celu porownania wyników
+```{R}
+holt_model_basic = holt(train, h=4)
+holt_model_basic$model
+```
+```{r}
+autoplot(holt_model_basic)
+```
+```{r}
+autoplot(test) +
+  autolayer(holt_model_basic, alpha= 0.5) +
+  ggtitle("Predicted vs actuals")
+```
+```{R}
+hist(holt_model_basic$residuals)
+```
+```{r}
+plot(holt_model_basic$fitted, holt_model_basic$residuals)
+title("fitted vs residuals")
+```
+
+```{r}
+autoplot(train) +
+  autolayer(holt_model_basic$mean,
+            color = "red") 
+```
+
+W modelu Holta jako parametr, który pozwala pozbyc się bledów z danych treningowych jest parametr beta, ktory przymuje wartosci od 0.0001 do 5 
+```{r}
+beta = seq(.0001, .5, by = .001)
+RMSE = c()
+for(i in seq_along(beta)) {
+  fit = holt(train, 
+              beta = beta[i],
+              h = 4)
+  RMSE[i] = accuracy(fit,
+                      test)[2,2]
+}
+
+beta_fit = data_frame(beta, RMSE)
+beta_min = filter(beta_fit,
+                   RMSE == min(RMSE))
+ 
+beta_min
+```
+```{r}
+ggplot(beta_fit, aes(beta, RMSE)) +
+  geom_line() +
+  geom_point(data = beta_min,
+             aes(beta, RMSE),
+             size = 2, color = "red") +
+  ggtitle("beta vs RMSE")
+```
+
+```{r}
+final_model_holt = holt(train,
+                    beta = 1e-04,
+                    h = 4)
+
+final_model_holt$model
+```
+
+
+
+```{r}
+autoplot(test) +
+  autolayer(final_model_holt, alpha= 0.5) +
+  ggtitle("Predicted vs actuals")
+```
+```{R}
+hist(final_model_holt$residuals)
+```
+```{r}
+plot(final_model_holt$fitted, final_model_holt$residuals)
+title("fitted vs residuals")
+```
+
+```{r}
+autoplot(train) +
+  autolayer(final_model_holt$mean,
+            color = "red") 
+```
+Statystyki opisujące modele
+```{r}
+accuracy(holt_model_basic, test)
+```
+```{r}
+accuracy(final_model_holt, test)
+```
+
+```{r}
+p1 <- autoplot(holt_model_basic) +
+  coord_cartesian(ylim = c(3500, 4030)) +
+  ggtitle("Original Holt's model") 
+ 
+p2 <- autoplot(final_model_holt) +
+  coord_cartesian(ylim = c(3500, 4030)) +
+  ggtitle("Optimal Holt's model")
+
+gridExtra::grid.arrange(p1, p2, nrow=1)
+```
+
+Porównąjąc model podstawowy do zopytamlizowanego, można zauwazyc, ze przedział ufnosci dla mozliwych wyników w przypadku modelu zoptymalizowanego jest mniejszy. RMSE w przypadku pierwszym jak i drugim jest na poziomnym poziomie = 37, natomiast wskaznik MAPE predykcji jest na poziomie ~ 8%, co swiadczy o dobrej predykcji dalszych wyników. W obu przypadkach rozkład residuów sprowadza się do rozkładu normalnego, oba modele znacząco się od siebie nie rożnią.
+
+
+PODSUMOWANIE WYNIKÓW
+
+Podsumowując, w modelu z wykorzystaniem SES otrzymaliśmy wniki z lepszym RMSE = 22,  w przypadku modelu Holta wynosi ono ~38, natomiast wznacząco różnią się wskazniki predkycji MAPE ponieważ w pierwszym przypadku najlepszy wynik uzysakliśmy z MAPE=90,  w modelu holta jest o wiele lepiej = 0.8. Podejżewam, ale nie jestem w stanie potwierdzić tej hipotezy, ze tak slaby MAPE w modelu nr 1 jest wynikiem usunięcia trendu z danych, co może wiazać się z wiekszą trudnością dalszych predykcji(w przypadku numer 2 znamy trend, co juz w pewnym stopniu ułatwia dalsze predykcje). Ze względu na brak potrzeby usuwania trendu z szeregu uważam, że nie mniej jednak algorytm Holta dał lepsze wyniki.
